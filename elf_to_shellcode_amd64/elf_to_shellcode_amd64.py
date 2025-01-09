@@ -1,8 +1,15 @@
+# 使用python3.8编译exe pyinstaller --hidden-import=keystone --collect-all keystone -F elf_to_shellcode_amd64.py
 import sys
-from pwn import *
+from keystone import *
 
-context.arch = 'amd64'
-context.bits = 64
+def print_bytes(encoding):
+    """以16进制格式打印字节"""
+    if encoding:
+        bytes_str = ' '.join([f'\\x{b:02x}' for b in encoding])
+        print(f"编码后的字节: {bytes_str}")
+        print(f"字节长度: {len(encoding)}")
+
+ks = Ks(KS_ARCH_X86, KS_MODE_64)
 
 arg_list = ''
 
@@ -93,6 +100,6 @@ argv_list:
 elf:
 '''.format(loader,arg_list)
 
-
-#print(sc)
-open("/proc/self/fd/1","wb").write(asm(sc) + elf_data)
+encoding, count = ks.asm(sc)
+# print_bytes(encoding)
+open(sys.argv[1],"wb").write(bytes(encoding) + elf_data)
