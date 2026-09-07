@@ -39,6 +39,29 @@ __always_inline int x_strlen(const char * s){
 	return p - s;
 }
 
+/*
+	注意：路径字符串必须放进 .text。
+	loader 是 objcopy -j .text 抽出来的，字符串若落在 .rodata 会丢失。
+*/
+__attribute__((section(".text"), used))
+static const char auxv_path[] = "/proc/self/auxv";
+
+/*
+	读取宿主进程的真实 auxv（/proc/self/auxv），
+	用于给被加载程序克隆一份接近内核提供的环境（vdso/HWCAP/UID 等）。
+	返回条目数，失败返回 0。
+*/
+__always_inline int read_host_auxv(Elf_auxv_t * buf,int max_entries){
+	int fd = x_openat(AT_FDCWD,auxv_path,O_RDONLY);
+	if(fd < 0)
+		return 0;
+	int n = x_read(fd,buf,max_entries * (int)sizeof(Elf_auxv_t));
+	x_close(fd);
+	if(n <= 0)
+		return 0;
+	return n / (int)sizeof(Elf_auxv_t);
+}
+
 __always_inline void x_memset(void *s, int c, size_t n)
 {
 	unsigned char *p = s, *e = p + n;
@@ -272,6 +295,7 @@ void x_execve(const char * file,int argc, const char ** argv,const char ** envp,
 	const char ** p, *s ;
 	int fd = 0;
 	const char*  null = NULL, * strings = NULL;
+	unsigned long prog_minva = 0;
 
 	if(envp == NULL){
 		envp = &null;
@@ -325,6 +349,18 @@ void x_execve(const char * file,int argc, const char ** argv,const char ** envp,
 
 		if (base[i] == LOAD_ERR){
 			x_exit(-7);
+		}
+
+		/* 记录主程序 LOAD 段的最小 vaddr（AT_PHDR 修正用）。
+		   phdr 是 alloca 出来的，下一轮循环会被覆盖，必须在这里算好。 */
+		if (i == X_PROG){
+			prog_minva = (unsigned long)-1;
+			for (iter = phdr; iter < &phdr[ehdr->e_phnum]; iter++){
+				if (iter->p_type != PT_LOAD)
+					continue;
+				if (iter->p_vaddr < prog_minva)
+					prog_minva = iter->p_vaddr;
+			}
 		}
 		
 		/* Set the entry point, if the file is dynamic than add bias. */
@@ -404,20 +440,56 @@ do { \
 	av++; \
 } while (0); \
 
-	NEW_AUX_ENT(AT_HWCAP, 0);
-	NEW_AUX_ENT(AT_PAGESZ, 0x1000);
-	NEW_AUX_ENT(AT_CLKTCK, 1000000L);
-	NEW_AUX_ENT(AT_PHDR, base[X_PROG] + ehdrs[X_PROG].e_phoff);
+	/*
+		AT_PHDR 修正：ET_DYN 且首个 LOAD 段 vaddr 不为 0 时（如 UPX 输出、
+		部分自定义链接的程序），phdr 实际映射在 base + prog_minva + e_phoff；
+		旧公式 base + e_phoff 会指向未映射区域，导致 UPX stub / ld.so 拿到
+		错误的 phdr 后跳到坏地址崩溃。
+	*/
+	unsigned long at_phdr = base[X_PROG] + ehdrs[X_PROG].e_phoff;
+	if (ehdrs[X_PROG].e_type == ET_DYN)
+		at_phdr += prog_minva;
+
+	/*
+		克隆宿主进程的真实 auxv（vdso AT_SYSINFO_EHDR、HWCAP、UID/GID 等），
+		只覆盖与被加载程序直接相关的项，让环境尽量接近内核 exec 的结果。
+	*/
+	{
+		Elf_auxv_t host_av[48];
+		int host_n = read_host_auxv(host_av, 48);
+		int copied = 0;
+
+		if (host_n > 0){
+			for (i = 0; i < host_n; i++){
+				long t = host_av[i].a_type;
+				if (t == AT_NULL)
+					break;
+				if (t == AT_PHDR || t == AT_PHENT || t == AT_PHNUM ||
+					t == AT_BASE || t == AT_ENTRY || t == AT_EXECFN || t == AT_RANDOM)
+					continue;
+				NEW_AUX_ENT(t, host_av[i].a_un.a_val);
+				copied++;
+			}
+		}
+
+		if (!copied){
+			NEW_AUX_ENT(AT_HWCAP, 0);
+			NEW_AUX_ENT(AT_PAGESZ, 0x1000);
+			NEW_AUX_ENT(AT_CLKTCK, 1000000L);
+			NEW_AUX_ENT(AT_UID, 0);
+			NEW_AUX_ENT(AT_EUID, 0);
+			NEW_AUX_ENT(AT_GID, 0);
+			NEW_AUX_ENT(AT_EGID, 0);
+		}
+	}
+
+	NEW_AUX_ENT(AT_PHDR, at_phdr);
 	NEW_AUX_ENT(AT_PHENT, ehdrs[X_PROG].e_phentsize);
 	NEW_AUX_ENT(AT_PHNUM, ehdrs[X_PROG].e_phnum);
-	NEW_AUX_ENT(AT_BASE, elf_interp ? base[X_INTERP] : 0);		//base address of interpreter 
+	NEW_AUX_ENT(AT_BASE, elf_interp ? base[X_INTERP] : 0);		//base address of interpreter
 	NEW_AUX_ENT(AT_ENTRY, entry[X_PROG]);						//entry of program.
 	NEW_AUX_ENT(AT_EXECFN, (unsigned long)argv[0]);
 	NEW_AUX_ENT(AT_RANDOM,(unsigned long)(av + 6));								//这里得是一段可读可写的区域.go的程序会修改random bytes.
-	NEW_AUX_ENT(AT_UID, 0);
-	NEW_AUX_ENT(AT_EUID, 0);
-	NEW_AUX_ENT(AT_GID, 0);
-	NEW_AUX_ENT(AT_EGID, 0);
 	NEW_AUX_ENT(AT_NULL,0);										//end flag....
 	
 #undef NEW_AUX_ENT
